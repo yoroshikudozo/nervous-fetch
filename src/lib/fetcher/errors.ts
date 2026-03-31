@@ -2,11 +2,11 @@ import { StatusCode } from "@/lib/fetcher/consts";
 
 export class HTTPError extends Error {
   status: StatusCode;
-  body: string;
+  body: unknown;
   constructor(
     status: StatusCode,
     statusText: string,
-    body: string,
+    body: unknown,
     cause?: unknown,
   ) {
     super(statusText, { cause });
@@ -41,5 +41,12 @@ export class ParseError extends Error {
   constructor(message: string, cause?: unknown) {
     super(message, { cause });
     this.name = "ParseError";
+  }
+}
+
+export class UnknownFetchError extends Error {
+  constructor(message: string, cause?: unknown) {
+    super(message, { cause });
+    this.name = "UnknownFetchError";
   }
 }

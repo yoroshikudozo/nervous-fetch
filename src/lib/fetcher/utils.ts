@@ -26,6 +26,11 @@ export const isRetryable = (error: Error, retryOn: number[]): boolean => {
   return true;
 };
 
+export const isJsonContentType = (response: Response): boolean => {
+  const contentType = response.headers.get("content-type");
+  return contentType?.includes("application/json") ?? false;
+};
+
 export function toErrorResponse(error: unknown, source = "external"): Response {
   if (error instanceof AbortError) {
     return Response.json(
