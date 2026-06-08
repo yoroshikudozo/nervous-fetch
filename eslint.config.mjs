@@ -14,6 +14,8 @@ const eslintConfig = defineConfig([
     "next-env.d.ts",
     // Vitest coverage output is generated, not source.
     "coverage/**",
+    // MSW's generated service worker.
+    "public/mockServiceWorker.js",
   ]),
 ]);
 
