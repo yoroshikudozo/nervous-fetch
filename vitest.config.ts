@@ -10,6 +10,7 @@ export default defineConfig({
   test: {
     environment: "node",
     globals: false,
+    setupFiles: ["./src/test/setup.ts"],
     coverage: {
       provider: "v8",
       // Enforce coverage only on the library core; app/config/client glue
