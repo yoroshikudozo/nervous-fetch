@@ -11,6 +11,9 @@ export default defineConfig({
     environment: "node",
     globals: false,
     setupFiles: ["./src/test/setup.ts"],
+    // Give the internal API an absolute origin so node fetch can resolve it
+    // (MSW intercepts it). The browser uses the relative "/api/posts".
+    env: { INTERNAL_BASE_URL: "http://localhost" },
     coverage: {
       provider: "v8",
       // Enforce coverage only on the library core; app/config/client glue

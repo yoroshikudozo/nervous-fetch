@@ -9,7 +9,10 @@ type UpdatePostInput = { id: number; title: string };
 // override with EXTERNAL_BASE_URL to point at a real backend.
 const EXTERNAL_BASE_URL =
   process.env.EXTERNAL_BASE_URL ?? "https://jsonplaceholder.typicode.com";
-const INTERNAL_POSTS_URL = "/api/posts";
+// "" in the browser keeps the relative "/api/posts"; node tests set an
+// absolute origin (INTERNAL_BASE_URL) so real fetch can resolve the URL.
+const INTERNAL_BASE_URL = process.env.INTERNAL_BASE_URL ?? "";
+const INTERNAL_POSTS_URL = `${INTERNAL_BASE_URL}/api/posts`;
 
 export const fetchPosts = () => fetcher<Post[]>(`${EXTERNAL_BASE_URL}/posts`);
 
