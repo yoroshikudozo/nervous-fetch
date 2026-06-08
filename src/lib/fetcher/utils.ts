@@ -6,12 +6,23 @@ import {
   NetworkError,
   ParseError,
   TimeoutError,
+  UnknownFetchError,
 } from "./errors";
 
+// browser / Node.js 18+ native fetch
+const isNativeAbort = (error: unknown): boolean =>
+  error instanceof DOMException && error.name === "AbortError";
+
+// server-side polyfill (e.g. node-fetch)
+const isPolyfillAbort = (error: unknown): boolean =>
+  error instanceof Error && error.name === "AbortError";
+
+// fallback for environments that set neither DOMException nor name
+const isLegacyAbort = (error: unknown): boolean =>
+  error instanceof Error && (error.message?.includes("aborted") ?? false);
+
 export const isAbortError = (error: unknown): boolean =>
-  error instanceof DOMException ||
-  (error instanceof Error &&
-    (error.name === "AbortError" || error.message?.includes("aborted")));
+  isNativeAbort(error) || isPolyfillAbort(error) || isLegacyAbort(error);
 
 export const isStatusCodeRetryable = (
   status: number,
@@ -62,6 +73,22 @@ export function toErrorResponse(error: unknown, source = "external"): Response {
       { status: error.status },
     );
   }
+  // Thrown by the fetcher when it wraps an unexpected error from the outbound
+  // request path, so the origin is the external call — keep `source`. Never
+  // echo the wrapped message to the client: it can carry internal details
+  // (DB hosts, file paths, stack hints) that aid an attacker. Log it instead.
+  if (error instanceof UnknownFetchError) {
+    console.error("Unexpected fetcher error:", error);
+    return Response.json(
+      { error: "Internal Server Error", source },
+      { status: STATUS_CODE.INTERNAL_SERVER_ERROR },
+    );
+  }
+
+  // Anything reaching here was not produced by the fetcher (no typed wrapper),
+  // so the origin is this API route itself — tag it `api_route`. Same no-leak
+  // rule applies: log the real error, return a generic message.
+  console.error("Unhandled error in route handler:", error);
   return Response.json(
     { error: "Internal Server Error", source: "api_route" },
     { status: STATUS_CODE.INTERNAL_SERVER_ERROR },

@@ -1,4 +1,6 @@
-import useSWR, { SWRConfiguration } from "swr";
+"use client";
+
+import useSWR, { type SWRConfiguration } from "swr";
 import { fetcher, isRetryable, FetcherOptions } from "@/lib/fetcher";
 import {
   RETRY_BASE_DELAY_MS,
