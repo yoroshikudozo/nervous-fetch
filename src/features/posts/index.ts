@@ -5,10 +5,11 @@ type Post = { id: number; title: string };
 type CreatePostInput = { title: string };
 type UpdatePostInput = { id: number; title: string };
 
-const EXTERNAL_POSTS_URL = "https://external-api.com/posts";
+const EXTERNAL_BASE_URL =
+  process.env.EXTERNAL_BASE_URL ?? "https://example.com";
 const INTERNAL_POSTS_URL = "/api/posts";
 
-export const fetchPosts = () => fetcher<Post[]>(EXTERNAL_POSTS_URL);
+export const fetchPosts = () => fetcher<Post[]>(`${EXTERNAL_BASE_URL}/posts`);
 
 export const createPost = (body: CreatePostInput) =>
   fetcher<Post>(INTERNAL_POSTS_URL, buildMutationOptions("POST", { body }));
