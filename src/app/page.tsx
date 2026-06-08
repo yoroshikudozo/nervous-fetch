@@ -1,4 +1,5 @@
 import { Posts } from "@/components/Posts";
+import { MswProvider } from "@/mocks/MswProvider";
 import { fetchPosts } from "@/features/posts";
 
 export default async function Home() {
@@ -11,7 +12,9 @@ export default async function Home() {
           <li key={post.id}>{post.title}</li>
         ))}
       </ul>
-      <Posts />
+      <MswProvider>
+        <Posts />
+      </MswProvider>
     </>
   );
 }
