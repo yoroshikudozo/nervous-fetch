@@ -1,9 +1,14 @@
-import { DEFAULT_TIMEOUT_MS, StatusCode } from "@/lib/fetcher/consts";
+import {
+  DEFAULT_TIMEOUT_MS,
+  MAX_RESPONSE_BYTES,
+  StatusCode,
+} from "@/lib/fetcher/consts";
 import {
   AbortError,
   HTTPError,
   NetworkError,
   ParseError,
+  ResponseTooLargeError,
   TimeoutError,
   UnknownFetchError,
 } from "@/lib/fetcher/errors";
@@ -16,12 +21,23 @@ async function parseResponse(response: Response): Promise<unknown> {
     return null;
   }
 
+  // content-length があれば本文を読む前に上限チェック（早期拒否でメモリを守る）
+  const declaredLength = response.headers.get("content-length");
+  if (declaredLength && Number(declaredLength) > MAX_RESPONSE_BYTES) {
+    throw new ResponseTooLargeError(MAX_RESPONSE_BYTES);
+  }
+
   let text: string;
   try {
     text = await response.text();
   } catch (error) {
     // ストリーム読み込み失敗はNetworkErrorとして扱う
     throw new NetworkError("Failed to read response body", error);
+  }
+
+  // content-length が無い（chunked等）場合に備え、読み終えた実サイズで再チェック
+  if (text.length > MAX_RESPONSE_BYTES) {
+    throw new ResponseTooLargeError(MAX_RESPONSE_BYTES);
   }
 
   const contentType = response.headers.get("content-type");
@@ -85,7 +101,12 @@ export async function fetcher<T>(
     if (error instanceof TypeError)
       throw new NetworkError("Network error", error);
     // 既知のカスタムエラーはそのまま pass through
-    if (error instanceof HTTPError || error instanceof ParseError) throw error;
+    if (
+      error instanceof HTTPError ||
+      error instanceof ParseError ||
+      error instanceof ResponseTooLargeError
+    )
+      throw error;
     // 予期しないエラーは UnknownFetchError でラップ
     throw new UnknownFetchError(
       error instanceof Error ? error.message : "Unknown error",

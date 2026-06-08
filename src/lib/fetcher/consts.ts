@@ -1,6 +1,9 @@
 export const DEFAULT_TIMEOUT_MS = 10000;
 export const RETRY_BASE_DELAY_MS = 1000;
 export const MAX_RETRY_COUNT = 3;
+// Upper bound on a response body we will buffer into memory (10 MiB), so a
+// hostile or runaway upstream can't OOM the process.
+export const MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
 
 export const STATUS_CODE = {
   BAD_REQUEST: 400,
@@ -10,6 +13,7 @@ export const STATUS_CODE = {
   METHOD_NOT_ALLOWED: 405,
   REQUEST_TIMEOUT: 408,
   CONFLICT: 409,
+  PAYLOAD_TOO_LARGE: 413,
   UNPROCESSABLE_ENTITY: 422,
   TOO_MANY_REQUESTS: 429,
   INTERNAL_SERVER_ERROR: 500,

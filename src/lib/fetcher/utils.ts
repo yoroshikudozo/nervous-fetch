@@ -5,6 +5,7 @@ import {
   HTTPError,
   NetworkError,
   ParseError,
+  ResponseTooLargeError,
   TimeoutError,
   UnknownFetchError,
 } from "./errors";
@@ -32,6 +33,8 @@ export const isStatusCodeRetryable = (
 export const isRetryable = (error: Error, retryOn: number[]): boolean => {
   if (error instanceof AbortError) return false;
   if (error instanceof ParseError) return false;
+  // Retrying won't make an oversized body smaller.
+  if (error instanceof ResponseTooLargeError) return false;
   if (error instanceof HTTPError)
     return isStatusCodeRetryable(error.status, retryOn);
   return true;
@@ -72,6 +75,12 @@ export function toErrorResponse(
     return Response.json(
       { error: error.message, source },
       { status: STATUS_CODE.BAD_GATEWAY },
+    );
+  }
+  if (error instanceof ResponseTooLargeError) {
+    return Response.json(
+      { error: error.message, source },
+      { status: STATUS_CODE.PAYLOAD_TOO_LARGE },
     );
   }
   if (error instanceof HTTPError) {

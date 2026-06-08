@@ -9,6 +9,7 @@ import {
   HTTPError,
   NetworkError,
   ParseError,
+  ResponseTooLargeError,
   TimeoutError,
   UnknownFetchError,
 } from "@/lib/fetcher/errors";
@@ -66,6 +67,10 @@ describe("isRetryable", () => {
   it("returns true for NetworkError", () => {
     expect(isRetryable(new NetworkError("network failure"), retryOn)).toBe(true);
   });
+
+  it("returns false for ResponseTooLargeError", () => {
+    expect(isRetryable(new ResponseTooLargeError(1000), retryOn)).toBe(false);
+  });
 });
 
 describe("toErrorResponse", () => {
@@ -101,6 +106,13 @@ describe("toErrorResponse", () => {
   it("returns 502 for ParseError", async () => {
     const res = toErrorResponse(new ParseError("invalid json"));
     expect(res.status).toBe(STATUS_CODE.BAD_GATEWAY);
+  });
+
+  it("returns 413 for ResponseTooLargeError", async () => {
+    const res = toErrorResponse(new ResponseTooLargeError(1000));
+    expect(res.status).toBe(STATUS_CODE.PAYLOAD_TOO_LARGE);
+    const body = await res.json();
+    expect(body.error).toContain("1000-byte limit");
   });
 
   it("mirrors the HTTP status for HTTPError", async () => {
