@@ -10,5 +10,23 @@ export default defineConfig({
   test: {
     environment: "node",
     globals: false,
+    coverage: {
+      provider: "v8",
+      // Enforce coverage only on the library core; app/config/client glue
+      // (hooks, re-exports, type-only files) is exercised by the app, not units.
+      include: ["src/lib/fetcher/**/*.ts"],
+      exclude: [
+        "src/lib/fetcher/index.ts",
+        "src/lib/fetcher/types.ts",
+        "src/lib/fetcher/hooks.ts",
+        "**/__tests__/**",
+      ],
+      thresholds: {
+        statements: 88,
+        branches: 80,
+        functions: 80,
+        lines: 88,
+      },
+    },
   },
 });
