@@ -42,7 +42,14 @@ export const isJsonContentType = (response: Response): boolean => {
   return contentType?.includes("application/json") ?? false;
 };
 
-export function toErrorResponse(error: unknown, source = "external"): Response {
+// Where an error originated, as reported to the client. `external` = the
+// outbound request the fetcher made; `api_route` = this route's own code.
+export type ErrorSource = "external" | "api_route";
+
+export function toErrorResponse(
+  error: unknown,
+  source: ErrorSource = "external",
+): Response {
   if (error instanceof AbortError) {
     return Response.json(
       { error: error.message, source },
