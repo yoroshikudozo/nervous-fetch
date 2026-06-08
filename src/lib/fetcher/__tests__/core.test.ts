@@ -5,8 +5,10 @@ import {
   HTTPError,
   NetworkError,
   ParseError,
+  ResponseTooLargeError,
   TimeoutError,
 } from "@/lib/fetcher/errors";
+import { MAX_RESPONSE_BYTES } from "@/lib/fetcher/consts";
 
 function makeResponse(
   body: unknown,
@@ -99,6 +101,40 @@ describe("fetcher", () => {
   it("throws NetworkError on TypeError from fetch", async () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("Failed to fetch")));
     await expect(fetcher("/api/test")).rejects.toThrow(NetworkError);
+  });
+
+  it("throws ResponseTooLargeError when content-length exceeds the limit", async () => {
+    // Body is tiny, but the declared content-length is huge: reject up-front.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response("{}", {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Length": String(MAX_RESPONSE_BYTES + 1),
+          },
+        }),
+      ),
+    );
+    await expect(fetcher("/api/huge")).rejects.toThrow(ResponseTooLargeError);
+  });
+
+  it("throws ResponseTooLargeError when the read body exceeds the limit", async () => {
+    // No content-length (chunked); caught by the post-read size check.
+    const huge = "x".repeat(MAX_RESPONSE_BYTES + 1);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(huge, {
+          status: 200,
+          headers: { "Content-Type": "text/plain" },
+        }),
+      ),
+    );
+    await expect(fetcher("/api/huge-chunked")).rejects.toThrow(
+      ResponseTooLargeError,
+    );
   });
 
   it("throws ParseError on invalid JSON with application/json content-type", async () => {

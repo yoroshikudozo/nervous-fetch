@@ -5,6 +5,7 @@ import {
   HTTPError,
   NetworkError,
   ParseError,
+  ResponseTooLargeError,
   TimeoutError,
   UnknownFetchError,
 } from "./errors";
@@ -32,6 +33,8 @@ export const isStatusCodeRetryable = (
 export const isRetryable = (error: Error, retryOn: number[]): boolean => {
   if (error instanceof AbortError) return false;
   if (error instanceof ParseError) return false;
+  // Retrying won't make an oversized body smaller.
+  if (error instanceof ResponseTooLargeError) return false;
   if (error instanceof HTTPError)
     return isStatusCodeRetryable(error.status, retryOn);
   return true;
@@ -42,7 +45,14 @@ export const isJsonContentType = (response: Response): boolean => {
   return contentType?.includes("application/json") ?? false;
 };
 
-export function toErrorResponse(error: unknown, source = "external"): Response {
+// Where an error originated, as reported to the client. `external` = the
+// outbound request the fetcher made; `api_route` = this route's own code.
+export type ErrorSource = "external" | "api_route";
+
+export function toErrorResponse(
+  error: unknown,
+  source: ErrorSource = "external",
+): Response {
   if (error instanceof AbortError) {
     return Response.json(
       { error: error.message, source },
@@ -65,6 +75,12 @@ export function toErrorResponse(error: unknown, source = "external"): Response {
     return Response.json(
       { error: error.message, source },
       { status: STATUS_CODE.BAD_GATEWAY },
+    );
+  }
+  if (error instanceof ResponseTooLargeError) {
+    return Response.json(
+      { error: error.message, source },
+      { status: STATUS_CODE.PAYLOAD_TOO_LARGE },
     );
   }
   if (error instanceof HTTPError) {

@@ -5,8 +5,10 @@ type Post = { id: number; title: string };
 type CreatePostInput = { title: string };
 type UpdatePostInput = { id: number; title: string };
 
+// Defaults to a public placeholder API so the demo actually returns posts;
+// override with EXTERNAL_BASE_URL to point at a real backend.
 const EXTERNAL_BASE_URL =
-  process.env.EXTERNAL_BASE_URL ?? "https://example.com";
+  process.env.EXTERNAL_BASE_URL ?? "https://jsonplaceholder.typicode.com";
 const INTERNAL_POSTS_URL = "/api/posts";
 
 export const fetchPosts = () => fetcher<Post[]>(`${EXTERNAL_BASE_URL}/posts`);

@@ -44,6 +44,13 @@ export class ParseError extends Error {
   }
 }
 
+export class ResponseTooLargeError extends Error {
+  constructor(maxBytes: number, cause?: unknown) {
+    super(`Response body exceeds the ${maxBytes}-byte limit`, { cause });
+    this.name = "ResponseTooLargeError";
+  }
+}
+
 export class UnknownFetchError extends Error {
   constructor(message: string, cause?: unknown) {
     super(message, { cause });

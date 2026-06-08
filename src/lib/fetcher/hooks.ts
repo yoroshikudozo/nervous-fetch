@@ -24,10 +24,12 @@ export function useFetcher<T>(url: string, options: UseFetcherOptions<T> = {}) {
     onErrorRetry: (error, _key, _config, revalidate, { retryCount }) => {
       if (!isRetryable(error, retryOn)) return;
       if (retryCount >= MAX_RETRY_COUNT) return;
-      setTimeout(
-        () => revalidate({ retryCount }),
-        RETRY_BASE_DELAY_MS * 2 ** retryCount,
-      );
+      // Exponential backoff with equal jitter, so many clients failing at the
+      // same moment don't retry in lockstep and hammer the server (thundering
+      // herd). Each retry waits half the backoff plus a random half.
+      const backoff = RETRY_BASE_DELAY_MS * 2 ** retryCount;
+      const delay = backoff / 2 + Math.random() * (backoff / 2);
+      setTimeout(() => revalidate({ retryCount }), delay);
     },
     ...swrOptions,
   });
