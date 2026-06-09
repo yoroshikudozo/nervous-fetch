@@ -56,6 +56,33 @@ async function parseResponse(response: Response): Promise<unknown> {
   return text;
 }
 
+// Map a failure from a single fetch lifecycle onto the custom error hierarchy.
+// Shared by the buffered fetcher and the streaming version (stream.ts) so both
+// surface the same error types. Callers should `throw mapRequestError(...)`.
+export function mapRequestError(
+  error: unknown,
+  reason: unknown,
+  timeout: number,
+): Error {
+  // Timeout is a special case of Abort, so check it first.
+  if (reason === "timeout") return new TimeoutError(timeout, error);
+  if (isAbortError(error)) return new AbortError(error);
+  if (error instanceof TypeError) return new NetworkError("Network error", error);
+  // Pass known custom errors through unchanged.
+  if (
+    error instanceof HTTPError ||
+    error instanceof NetworkError ||
+    error instanceof ParseError ||
+    error instanceof ResponseTooLargeError
+  )
+    return error;
+  // Wrap unexpected errors in UnknownFetchError.
+  return new UnknownFetchError(
+    error instanceof Error ? error.message : "Unknown error",
+    error,
+  );
+}
+
 export async function fetcher<T>(
   url: string,
   options: FetcherOptions = {},
@@ -94,24 +121,7 @@ export async function fetcher<T>(
 
     return body as T;
   } catch (error) {
-    // TimeoutはAbortの特殊ケースなので先に判定
-    if (controller.signal.reason === "timeout")
-      throw new TimeoutError(timeout, error);
-    if (isAbortError(error)) throw new AbortError(error);
-    if (error instanceof TypeError)
-      throw new NetworkError("Network error", error);
-    // 既知のカスタムエラーはそのまま pass through
-    if (
-      error instanceof HTTPError ||
-      error instanceof ParseError ||
-      error instanceof ResponseTooLargeError
-    )
-      throw error;
-    // 予期しないエラーは UnknownFetchError でラップ
-    throw new UnknownFetchError(
-      error instanceof Error ? error.message : "Unknown error",
-      error,
-    );
+    throw mapRequestError(error, controller.signal.reason, timeout);
   } finally {
     clearTimeout(timeoutId);
     fetchOptions.signal?.removeEventListener("abort", onAbort);
