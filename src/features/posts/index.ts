@@ -14,7 +14,15 @@ const EXTERNAL_BASE_URL =
 const INTERNAL_BASE_URL = process.env.INTERNAL_BASE_URL ?? "";
 const INTERNAL_POSTS_URL = `${INTERNAL_BASE_URL}/api/posts`;
 
-export const fetchPosts = () => fetcher<Post[]>(`${EXTERNAL_BASE_URL}/posts`);
+// Server-side "staleTime": cache the external list, but treat it as stale after
+// REVALIDATE_SECONDS so Next refreshes it in the background. Tagged "posts" so a
+// mutation can evict it on demand (memory + disk) via revalidateTag("posts").
+const REVALIDATE_SECONDS = 60;
+
+export const fetchPosts = () =>
+  fetcher<Post[]>(`${EXTERNAL_BASE_URL}/posts`, {
+    next: { revalidate: REVALIDATE_SECONDS, tags: ["posts"] },
+  });
 
 export const createPost = (body: CreatePostInput) =>
   fetcher<Post>(INTERNAL_POSTS_URL, buildMutationOptions("POST", { body }));
