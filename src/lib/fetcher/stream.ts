@@ -149,7 +149,7 @@ export async function* streamNdjson<T>(
     const lines = toLines(decode(monitor(readBytes(response.body, controller, timeout))));
     for await (const line of lines) yield parseLine<T>(line);
   } catch (error) {
-    // If the external signal aborted, return AbortError regardless of any reason race.
+    // If the external signal aborted, throw AbortError regardless of any reason race.
     if (fetchOptions.signal?.aborted) throw new AbortError(error);
     throw mapRequestError(error, controller.signal.reason, timeout);
   } finally {

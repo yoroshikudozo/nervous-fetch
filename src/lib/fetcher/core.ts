@@ -16,12 +16,12 @@ import { FetcherOptions, MutationOptions } from "@/lib/fetcher/types";
 import { isAbortError } from "@/lib/fetcher/utils";
 
 async function parseResponse(response: Response): Promise<unknown> {
-  // 204 No Content と 304 Not Modified は body がない正常な状態
+  // 204 No Content and 304 Not Modified are valid responses with no body.
   if (response.status === 204 || response.status === 304) {
     return null;
   }
 
-  // content-length があれば本文を読む前に上限チェック（早期拒否でメモリを守る）
+  // If content-length is present, enforce the cap before reading the body (reject early to protect memory).
   const declaredLength = response.headers.get("content-length");
   if (declaredLength && Number(declaredLength) > MAX_RESPONSE_BYTES) {
     throw new ResponseTooLargeError(MAX_RESPONSE_BYTES);
@@ -31,11 +31,11 @@ async function parseResponse(response: Response): Promise<unknown> {
   try {
     text = await response.text();
   } catch (error) {
-    // ストリーム読み込み失敗はNetworkErrorとして扱う
+    // Treat a stream read failure as a NetworkError.
     throw new NetworkError("Failed to read response body", error);
   }
 
-  // content-length が無い（chunked等）場合に備え、読み終えた実サイズで再チェック
+  // In case content-length is absent (e.g. chunked), re-check against the actual read size.
   if (text.length > MAX_RESPONSE_BYTES) {
     throw new ResponseTooLargeError(MAX_RESPONSE_BYTES);
   }
@@ -99,7 +99,7 @@ export function linkAbortSignal(external?: AbortSignal | null): {
   external?.addEventListener("abort", onAbort);
   const cleanup = () => external?.removeEventListener("abort", onAbort);
 
-  // 登録後に再チェック（addEventListener前にabortされていた場合の競合対策）
+  // Re-check after registering, in case it aborted in the window before addEventListener ran.
   if (external?.aborted) {
     controller.abort("external");
     cleanup();
@@ -135,7 +135,7 @@ export async function fetcher<T>(
 
     return body as T;
   } catch (error) {
-    // If the external signal aborted, return AbortError reliably even when a race
+    // If the external signal aborted, throw AbortError reliably even when a race
     // with the timeout overwrote the reason with "timeout".
     if (fetchOptions.signal?.aborted) throw new AbortError(error);
     throw mapRequestError(error, controller.signal.reason, timeout);
@@ -152,7 +152,7 @@ export function buildMutationOptions(
   const { body, ...rest } = options;
 
   if (body instanceof FormData) {
-    // FormDataはfetchが自動でContent-Typeをセットするので手動でセットしない
+    // fetch sets Content-Type automatically for FormData, so don't set it manually.
     return { ...rest, method, body };
   }
 
