@@ -7,7 +7,6 @@ import {
   StatusCode,
 } from "@/lib/fetcher/consts";
 import {
-  AbortError,
   HTTPError,
   NetworkError,
   ParseError,
@@ -92,12 +91,16 @@ async function* toLines(
   let buffer = "";
   for await (const text of texts) {
     buffer += text;
+    // Walk a cursor over the buffer and drop the consumed prefix once per chunk,
+    // instead of reallocating the whole buffer on every newline.
+    let start = 0;
     let newline: number;
-    while ((newline = buffer.indexOf("\n")) !== -1) {
-      const line = buffer.slice(0, newline).trim();
-      buffer = buffer.slice(newline + 1);
+    while ((newline = buffer.indexOf("\n", start)) !== -1) {
+      const line = buffer.slice(start, newline).trim();
+      start = newline + 1;
       if (line) yield line;
     }
+    if (start > 0) buffer = buffer.slice(start);
   }
   const last = buffer.trim();
   if (last) yield last;
@@ -124,7 +127,7 @@ export async function* streamNdjson<T>(
   options: FetcherOptions = {},
 ): AsyncGenerator<T> {
   const { timeout = DEFAULT_TIMEOUT_MS, ...fetchOptions } = options;
-  const { controller, cleanup } = linkAbortSignal(fetchOptions.signal);
+  const { controller, cleanup, getReason } = linkAbortSignal(fetchOptions.signal);
   // Timeout for connecting; once streaming, each read is timed in readBytes.
   const connectTimer = setTimeout(() => controller.abort("timeout"), timeout);
 
@@ -149,9 +152,7 @@ export async function* streamNdjson<T>(
     const lines = toLines(decode(monitor(readBytes(response.body, controller, timeout))));
     for await (const line of lines) yield parseLine<T>(line);
   } catch (error) {
-    // If the external signal aborted, throw AbortError regardless of any reason race.
-    if (fetchOptions.signal?.aborted) throw new AbortError(error);
-    throw mapRequestError(error, controller.signal.reason, timeout);
+    throw mapRequestError(error, getReason(), timeout);
   } finally {
     clearTimeout(connectTimer);
     cleanup();

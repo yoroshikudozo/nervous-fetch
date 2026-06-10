@@ -58,13 +58,17 @@ async function parseResponse(response: Response): Promise<unknown> {
 
 // Map a failure from a single fetch lifecycle onto the custom error hierarchy.
 // Shared by the buffered fetcher and the streaming version (stream.ts) so both
-// surface the same error types. Callers should `throw mapRequestError(...)`.
+// surface the same error types. `reason` is the abort reason that owns the
+// timeout-vs-cancel precedence (see linkAbortSignal.getReason). Callers should
+// `throw mapRequestError(...)`.
 export function mapRequestError(
   error: unknown,
   reason: unknown,
   timeout: number,
 ): Error {
-  // Timeout is a special case of Abort, so check it first.
+  // A caller cancel outranks a timeout that won the abort() reason race.
+  if (reason === "external") return new AbortError(error);
+  // Timeout is a special case of Abort, so check it next.
   if (reason === "timeout") return new TimeoutError(timeout, error);
   if (isAbortError(error)) return new AbortError(error);
   if (error instanceof TypeError) return new NetworkError("Network error", error);
@@ -87,10 +91,13 @@ export function mapRequestError(
 // we pass to fetch, so a timeout (controller) and a caller cancel (external)
 // share one signal. Shared by the buffered fetcher and streaming reader. Throws
 // AbortError immediately if the external signal is already aborted; the returned
-// `cleanup` detaches the listener and must be called in a finally.
+// `cleanup` detaches the listener and must be called in a finally. `getReason`
+// returns the abort reason for error mapping, forcing external cancel to outrank
+// a timeout that won the (idempotent) abort() reason race.
 export function linkAbortSignal(external?: AbortSignal | null): {
   controller: AbortController;
   cleanup: () => void;
+  getReason: () => unknown;
 } {
   if (external?.aborted) throw new AbortError();
 
@@ -106,7 +113,10 @@ export function linkAbortSignal(external?: AbortSignal | null): {
     throw new AbortError();
   }
 
-  return { controller, cleanup };
+  const getReason = () =>
+    external?.aborted ? "external" : controller.signal.reason;
+
+  return { controller, cleanup, getReason };
 }
 
 export async function fetcher<T>(
@@ -114,7 +124,7 @@ export async function fetcher<T>(
   options: FetcherOptions = {},
 ): Promise<T> {
   const { timeout = DEFAULT_TIMEOUT_MS, ...fetchOptions } = options;
-  const { controller, cleanup } = linkAbortSignal(fetchOptions.signal);
+  const { controller, cleanup, getReason } = linkAbortSignal(fetchOptions.signal);
   const timeoutId = setTimeout(() => controller.abort("timeout"), timeout);
 
   try {
@@ -135,10 +145,7 @@ export async function fetcher<T>(
 
     return body as T;
   } catch (error) {
-    // If the external signal aborted, throw AbortError reliably even when a race
-    // with the timeout overwrote the reason with "timeout".
-    if (fetchOptions.signal?.aborted) throw new AbortError(error);
-    throw mapRequestError(error, controller.signal.reason, timeout);
+    throw mapRequestError(error, getReason(), timeout);
   } finally {
     clearTimeout(timeoutId);
     cleanup();
