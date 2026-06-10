@@ -83,24 +83,38 @@ export function mapRequestError(
   );
 }
 
+// Link an optional external AbortSignal to a fresh AbortController whose signal
+// we pass to fetch, so a timeout (controller) and a caller cancel (external)
+// share one signal. Shared by the buffered fetcher and streaming reader. Throws
+// AbortError immediately if the external signal is already aborted; the returned
+// `cleanup` detaches the listener and must be called in a finally.
+export function linkAbortSignal(external?: AbortSignal | null): {
+  controller: AbortController;
+  cleanup: () => void;
+} {
+  if (external?.aborted) throw new AbortError();
+
+  const controller = new AbortController();
+  const onAbort = () => controller.abort("external");
+  external?.addEventListener("abort", onAbort);
+  const cleanup = () => external?.removeEventListener("abort", onAbort);
+
+  // 登録後に再チェック（addEventListener前にabortされていた場合の競合対策）
+  if (external?.aborted) {
+    controller.abort("external");
+    cleanup();
+    throw new AbortError();
+  }
+
+  return { controller, cleanup };
+}
+
 export async function fetcher<T>(
   url: string,
   options: FetcherOptions = {},
 ): Promise<T> {
   const { timeout = DEFAULT_TIMEOUT_MS, ...fetchOptions } = options;
-
-  if (fetchOptions.signal?.aborted) throw new AbortError();
-
-  const controller = new AbortController();
-  const onAbort = () => controller.abort("external");
-  fetchOptions.signal?.addEventListener("abort", onAbort);
-
-  // 登録後に再チェック（addEventListener前にabortされていた場合の競合対策）
-  if (fetchOptions.signal?.aborted) {
-    controller.abort("external");
-    throw new AbortError();
-  }
-
+  const { controller, cleanup } = linkAbortSignal(fetchOptions.signal);
   const timeoutId = setTimeout(() => controller.abort("timeout"), timeout);
 
   try {
@@ -121,10 +135,13 @@ export async function fetcher<T>(
 
     return body as T;
   } catch (error) {
+    // If the external signal aborted, return AbortError reliably even when a race
+    // with the timeout overwrote the reason with "timeout".
+    if (fetchOptions.signal?.aborted) throw new AbortError(error);
     throw mapRequestError(error, controller.signal.reason, timeout);
   } finally {
     clearTimeout(timeoutId);
-    fetchOptions.signal?.removeEventListener("abort", onAbort);
+    cleanup();
   }
 }
 
