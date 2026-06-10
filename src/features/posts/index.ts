@@ -51,7 +51,9 @@ export const usePosts = () => useFetcher<Post[]>(INTERNAL_POSTS_URL);
 export const streamPosts = (options?: ResumeOptions) =>
   streamWithResume<Post>(
     (cursor) =>
-      `${INTERNAL_POSTS_URL}/stream${cursor ? `?after=${cursor}` : ""}`,
+      `${INTERNAL_POSTS_URL}/stream${
+        cursor ? `?after=${encodeURIComponent(cursor)}` : ""
+      }`,
     (post) => String(post.id),
     options,
   );

@@ -1,4 +1,4 @@
-import { mapRequestError } from "@/lib/fetcher/core";
+import { linkAbortSignal, mapRequestError } from "@/lib/fetcher/core";
 import {
   DEFAULT_RETRY_ON,
   DEFAULT_TIMEOUT_MS,
@@ -12,33 +12,41 @@ import {
   NetworkError,
   ParseError,
   ResponseTooLargeError,
-  TimeoutError,
 } from "@/lib/fetcher/errors";
 import { FetcherOptions } from "@/lib/fetcher/types";
-import { isAbortError } from "@/lib/fetcher/utils";
+import { isAbortError, isRetryable } from "@/lib/fetcher/utils";
 
 // The body is consumed as a small pipeline of single-responsibility async
 // generators, so the orchestration reads top-to-bottom and the only mutable
 // state left lives — isolated — inside the stage that needs it:
 //
 //   readBytes ─▶ monitor ─▶ decode ─▶ toLines ─▶ parseLine
-//   (raw bytes) (size+idle) (text)   (whole lines) (items)
+//   (read+time) (size cap) (text)    (whole lines) (items)
 
 /** Iterate a byte stream via a reader (works in every runtime, unlike
  * `for await` over a ReadableStream), normalizing a mid-stream failure to
- * NetworkError so it is classified like a dropped connection (and resumable). */
+ * NetworkError so it is classified like a dropped connection (and resumable).
+ *
+ * The idle timeout is armed around each `reader.read()` and cleared the instant
+ * data arrives — so it measures network inactivity only, not how long the
+ * consumer spends processing the chunk we yield (which must not count). */
 async function* readBytes(
   stream: ReadableStream<Uint8Array>,
+  controller: AbortController,
+  timeout: number,
 ): AsyncGenerator<Uint8Array> {
   const reader = stream.getReader();
   try {
     while (true) {
+      const timer = setTimeout(() => controller.abort("timeout"), timeout);
       let result: ReadableStreamReadResult<Uint8Array>;
       try {
         result = await reader.read();
       } catch (error) {
         if (isAbortError(error)) throw error; // let the mapper classify abort/timeout
         throw new NetworkError("Stream interrupted", error);
+      } finally {
+        clearTimeout(timer); // stop timing before the (untimed) consumer work
       }
       if (result.done) return;
       yield result.value;
@@ -49,15 +57,12 @@ async function* readBytes(
   }
 }
 
-/** Pass bytes through untouched while enforcing the size cap and resetting the
- * idle timeout on every chunk (so an active stream stays alive). */
+/** Pass bytes through untouched while enforcing the response-size cap. */
 async function* monitor(
   chunks: AsyncIterable<Uint8Array>,
-  onChunk: () => void,
 ): AsyncGenerator<Uint8Array> {
   let total = 0;
   for await (const chunk of chunks) {
-    onChunk();
     total += chunk.byteLength;
     if (total > MAX_RESPONSE_BYTES) {
       throw new ResponseTooLargeError(MAX_RESPONSE_BYTES);
@@ -110,80 +115,63 @@ function parseLine<T>(line: string): T {
  * Stream a newline-delimited JSON (NDJSON) response, yielding one parsed item
  * per line as it arrives instead of buffering the whole body.
  *
- * Shares the request lifecycle with `fetcher`: external-signal linking and the
- * same error mapping (`mapRequestError`). The timeout is an *idle* timeout,
- * re-armed on every chunk, so a long but active stream is not killed while a
- * stalled one still aborts.
+ * Shares the request lifecycle with `fetcher` (linkAbortSignal + mapRequestError).
+ * The timeout covers connection setup and then each individual read (see
+ * readBytes), so it reflects network inactivity rather than consumer speed.
  */
 export async function* streamNdjson<T>(
   url: string,
   options: FetcherOptions = {},
 ): AsyncGenerator<T> {
   const { timeout = DEFAULT_TIMEOUT_MS, ...fetchOptions } = options;
-
-  if (fetchOptions.signal?.aborted) throw new AbortError();
-
-  const controller = new AbortController();
-  const onAbort = () => controller.abort("external");
-  fetchOptions.signal?.addEventListener("abort", onAbort);
-  // 登録後に再チェック（addEventListener前にabortされていた場合の競合対策）
-  if (fetchOptions.signal?.aborted) {
-    controller.abort("external");
-    throw new AbortError();
-  }
-
-  // One mutable handle for the idle timer: re-armed on activity, cleared on exit.
-  let timeoutId: ReturnType<typeof setTimeout> | undefined;
-  const arm = () => {
-    clearTimeout(timeoutId);
-    timeoutId = setTimeout(() => controller.abort("timeout"), timeout);
-  };
+  const { controller, cleanup } = linkAbortSignal(fetchOptions.signal);
+  // Timeout for connecting; once streaming, each read is timed in readBytes.
+  const connectTimer = setTimeout(() => controller.abort("timeout"), timeout);
 
   try {
-    arm();
     const response = await fetch(url, {
       ...fetchOptions,
       signal: controller.signal,
     });
+    clearTimeout(connectTimer);
 
+    // 204/304 are body-less successful completions (matches the buffered parseResponse).
+    if (response.status === 204 || response.status === 304) return;
     if (!response.ok) {
       throw new HTTPError(
         response.status as StatusCode,
         response.statusText,
-        null,
+        await response.text().catch(() => null),
       );
     }
     if (!response.body) return;
 
-    const lines = toLines(decode(monitor(readBytes(response.body), arm)));
+    const lines = toLines(decode(monitor(readBytes(response.body, controller, timeout))));
     for await (const line of lines) yield parseLine<T>(line);
   } catch (error) {
+    // If the external signal aborted, return AbortError regardless of any reason race.
+    if (fetchOptions.signal?.aborted) throw new AbortError(error);
     throw mapRequestError(error, controller.signal.reason, timeout);
   } finally {
-    clearTimeout(timeoutId);
-    fetchOptions.signal?.removeEventListener("abort", onAbort);
+    clearTimeout(connectTimer);
+    cleanup();
   }
 }
 
-/** Whether a streaming failure is worth transparently resuming from a cursor. */
-export function isResumable(error: unknown): boolean {
-  if (error instanceof NetworkError || error instanceof TimeoutError)
-    return true;
-  if (error instanceof HTTPError) return DEFAULT_RETRY_ON.includes(error.status);
-  return false;
-}
-
 export interface ResumeOptions extends FetcherOptions {
-  /** Max reconnects before giving up and rethrowing the failure. */
+  /** Max *consecutive* no-progress reconnects before giving up and rethrowing. */
   maxResumes?: number;
 }
 
 /**
- * Drive `streamNdjson` with cursor-based resume. On a resumable mid-stream
+ * Drive `streamNdjson` with cursor-based resume. On a retryable mid-stream
  * failure it reconnects from the last successfully-yielded item's cursor
  * (`buildUrl(cursor)` turns it into e.g. `?after=<cursor>`) and keeps going, so
- * the consumer sees one continuous, de-duplicated stream. A non-resumable error
- * (abort, 4xx, parse) or exceeding `maxResumes` rethrows.
+ * the consumer sees one continuous, de-duplicated stream. A non-retryable error
+ * (abort, 4xx, parse) rethrows; the same `isRetryable` policy is used as the
+ * buffered SWR path. `maxResumes` bounds *consecutive* failed reconnects — any
+ * forward progress refreshes the budget, so a long flaky-but-advancing stream
+ * is not truncated.
  *
  * Requires the server to honor the cursor (return only items strictly after it);
  * otherwise resumed items would duplicate.
@@ -198,21 +186,25 @@ export async function* streamWithResume<T>(
   let resumes = 0;
 
   while (true) {
+    let progressed = false;
     try {
       for await (const item of streamNdjson<T>(buildUrl(cursor), fetchOptions)) {
         cursor = getCursor(item);
+        progressed = true;
         yield item;
       }
       return;
     } catch (error) {
       if (
         fetchOptions.signal?.aborted ||
-        resumes >= maxResumes ||
-        !isResumable(error)
+        !(error instanceof Error) ||
+        !isRetryable(error, DEFAULT_RETRY_ON)
       ) {
         throw error;
       }
-      resumes += 1;
+      // Reset the budget on progress; only zero-progress consecutive reconnects hit maxResumes.
+      if (progressed) resumes = 0;
+      else if (++resumes > maxResumes) throw error;
     }
   }
 }
