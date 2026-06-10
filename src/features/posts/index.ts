@@ -1,4 +1,9 @@
-import { buildMutationOptions, fetcher } from "@/lib/fetcher";
+import {
+  buildMutationOptions,
+  fetcher,
+  streamWithResume,
+  type ResumeOptions,
+} from "@/lib/fetcher";
 import { useFetcher } from "@/lib/fetcher/hooks";
 
 type Post = { id: number; title: string };
@@ -40,3 +45,15 @@ export const deletePost = (id: number) =>
   );
 
 export const usePosts = () => useFetcher<Post[]>(INTERNAL_POSTS_URL);
+
+// Streams posts as NDJSON and transparently resumes from the last post's id
+// (?after=<id>) if the connection drops mid-stream.
+export const streamPosts = (options?: ResumeOptions) =>
+  streamWithResume<Post>(
+    (cursor) =>
+      `${INTERNAL_POSTS_URL}/stream${
+        cursor ? `?after=${encodeURIComponent(cursor)}` : ""
+      }`,
+    (post) => String(post.id),
+    options,
+  );

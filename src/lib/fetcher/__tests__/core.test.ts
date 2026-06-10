@@ -1,7 +1,11 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { http, HttpResponse, delay } from "msw";
 import { server } from "@/mocks/server";
-import { fetcher, buildMutationOptions } from "@/lib/fetcher/core";
+import {
+  fetcher,
+  buildMutationOptions,
+  mapRequestError,
+} from "@/lib/fetcher/core";
 import {
   AbortError,
   HTTPError,
@@ -176,5 +180,19 @@ describe("buildMutationOptions", () => {
   it("sets body to undefined when no body provided", () => {
     const opts = buildMutationOptions("DELETE", {});
     expect(opts.body).toBeUndefined();
+  });
+});
+
+describe("mapRequestError", () => {
+  it("maps an 'external' reason to AbortError, outranking the error type", () => {
+    // A caller cancel must win even when the timeout overwrote the abort reason
+    // and the surfaced error looks like something else (e.g. a network failure).
+    const result = mapRequestError(new TypeError("boom"), "external", 1000);
+    expect(result).toBeInstanceOf(AbortError);
+  });
+
+  it("maps a 'timeout' reason to TimeoutError", () => {
+    const result = mapRequestError(new Error("boom"), "timeout", 1000);
+    expect(result).toBeInstanceOf(TimeoutError);
   });
 });

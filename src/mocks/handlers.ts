@@ -7,6 +7,25 @@ export const handlers = [
   // Internal API consumed by the client (usePosts) and the mutations.
   http.get("*/api/posts", () => HttpResponse.json(db.list())),
 
+  // Streaming variant: emits posts as NDJSON (one line per post) and honors an
+  // `?after=<id>` cursor so a client can resume from where a broken stream left.
+  http.get("*/api/posts/stream", ({ request }) => {
+    const after = Number(new URL(request.url).searchParams.get("after") ?? "0");
+    const items = db.list().filter((post) => post.id > after);
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const item of items) {
+          controller.enqueue(encoder.encode(`${JSON.stringify(item)}\n`));
+        }
+        controller.close();
+      },
+    });
+    return new HttpResponse(stream, {
+      headers: { "Content-Type": "application/x-ndjson" },
+    });
+  }),
+
   http.post("*/api/posts", async ({ request }) => {
     const body = (await request.json()) as { title: string };
     return HttpResponse.json(db.create(body), { status: 201 });

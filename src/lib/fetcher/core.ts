@@ -16,12 +16,12 @@ import { FetcherOptions, MutationOptions } from "@/lib/fetcher/types";
 import { isAbortError } from "@/lib/fetcher/utils";
 
 async function parseResponse(response: Response): Promise<unknown> {
-  // 204 No Content と 304 Not Modified は body がない正常な状態
+  // 204 No Content and 304 Not Modified are valid responses with no body.
   if (response.status === 204 || response.status === 304) {
     return null;
   }
 
-  // content-length があれば本文を読む前に上限チェック（早期拒否でメモリを守る）
+  // If content-length is present, enforce the cap before reading the body (reject early to protect memory).
   const declaredLength = response.headers.get("content-length");
   if (declaredLength && Number(declaredLength) > MAX_RESPONSE_BYTES) {
     throw new ResponseTooLargeError(MAX_RESPONSE_BYTES);
@@ -31,11 +31,11 @@ async function parseResponse(response: Response): Promise<unknown> {
   try {
     text = await response.text();
   } catch (error) {
-    // ストリーム読み込み失敗はNetworkErrorとして扱う
+    // Treat a stream read failure as a NetworkError.
     throw new NetworkError("Failed to read response body", error);
   }
 
-  // content-length が無い（chunked等）場合に備え、読み終えた実サイズで再チェック
+  // In case content-length is absent (e.g. chunked), re-check against the actual read size.
   if (text.length > MAX_RESPONSE_BYTES) {
     throw new ResponseTooLargeError(MAX_RESPONSE_BYTES);
   }
@@ -56,24 +56,75 @@ async function parseResponse(response: Response): Promise<unknown> {
   return text;
 }
 
+// Map a failure from a single fetch lifecycle onto the custom error hierarchy.
+// Shared by the buffered fetcher and the streaming version (stream.ts) so both
+// surface the same error types. `reason` is the abort reason that owns the
+// timeout-vs-cancel precedence (see linkAbortSignal.getReason). Callers should
+// `throw mapRequestError(...)`.
+export function mapRequestError(
+  error: unknown,
+  reason: unknown,
+  timeout: number,
+): Error {
+  // A caller cancel outranks a timeout that won the abort() reason race.
+  if (reason === "external") return new AbortError(error);
+  // Timeout is a special case of Abort, so check it next.
+  if (reason === "timeout") return new TimeoutError(timeout, error);
+  if (isAbortError(error)) return new AbortError(error);
+  if (error instanceof TypeError) return new NetworkError("Network error", error);
+  // Pass known custom errors through unchanged.
+  if (
+    error instanceof HTTPError ||
+    error instanceof NetworkError ||
+    error instanceof ParseError ||
+    error instanceof ResponseTooLargeError
+  )
+    return error;
+  // Wrap unexpected errors in UnknownFetchError.
+  return new UnknownFetchError(
+    error instanceof Error ? error.message : "Unknown error",
+    error,
+  );
+}
+
+// Link an optional external AbortSignal to a fresh AbortController whose signal
+// we pass to fetch, so a timeout (controller) and a caller cancel (external)
+// share one signal. Shared by the buffered fetcher and streaming reader. Throws
+// AbortError immediately if the external signal is already aborted; the returned
+// `cleanup` detaches the listener and must be called in a finally. `getReason`
+// returns the abort reason for error mapping, forcing external cancel to outrank
+// a timeout that won the (idempotent) abort() reason race.
+export function linkAbortSignal(external?: AbortSignal | null): {
+  controller: AbortController;
+  cleanup: () => void;
+  getReason: () => unknown;
+} {
+  if (external?.aborted) throw new AbortError();
+
+  const controller = new AbortController();
+  const onAbort = () => controller.abort("external");
+  external?.addEventListener("abort", onAbort);
+  const cleanup = () => external?.removeEventListener("abort", onAbort);
+
+  // Re-check after registering, in case it aborted in the window before addEventListener ran.
+  if (external?.aborted) {
+    controller.abort("external");
+    cleanup();
+    throw new AbortError();
+  }
+
+  const getReason = () =>
+    external?.aborted ? "external" : controller.signal.reason;
+
+  return { controller, cleanup, getReason };
+}
+
 export async function fetcher<T>(
   url: string,
   options: FetcherOptions = {},
 ): Promise<T> {
   const { timeout = DEFAULT_TIMEOUT_MS, ...fetchOptions } = options;
-
-  if (fetchOptions.signal?.aborted) throw new AbortError();
-
-  const controller = new AbortController();
-  const onAbort = () => controller.abort("external");
-  fetchOptions.signal?.addEventListener("abort", onAbort);
-
-  // 登録後に再チェック（addEventListener前にabortされていた場合の競合対策）
-  if (fetchOptions.signal?.aborted) {
-    controller.abort("external");
-    throw new AbortError();
-  }
-
+  const { controller, cleanup, getReason } = linkAbortSignal(fetchOptions.signal);
   const timeoutId = setTimeout(() => controller.abort("timeout"), timeout);
 
   try {
@@ -94,27 +145,10 @@ export async function fetcher<T>(
 
     return body as T;
   } catch (error) {
-    // TimeoutはAbortの特殊ケースなので先に判定
-    if (controller.signal.reason === "timeout")
-      throw new TimeoutError(timeout, error);
-    if (isAbortError(error)) throw new AbortError(error);
-    if (error instanceof TypeError)
-      throw new NetworkError("Network error", error);
-    // 既知のカスタムエラーはそのまま pass through
-    if (
-      error instanceof HTTPError ||
-      error instanceof ParseError ||
-      error instanceof ResponseTooLargeError
-    )
-      throw error;
-    // 予期しないエラーは UnknownFetchError でラップ
-    throw new UnknownFetchError(
-      error instanceof Error ? error.message : "Unknown error",
-      error,
-    );
+    throw mapRequestError(error, getReason(), timeout);
   } finally {
     clearTimeout(timeoutId);
-    fetchOptions.signal?.removeEventListener("abort", onAbort);
+    cleanup();
   }
 }
 
@@ -125,7 +159,7 @@ export function buildMutationOptions(
   const { body, ...rest } = options;
 
   if (body instanceof FormData) {
-    // FormDataはfetchが自動でContent-Typeをセットするので手動でセットしない
+    // fetch sets Content-Type automatically for FormData, so don't set it manually.
     return { ...rest, method, body };
   }
 
