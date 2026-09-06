@@ -7,9 +7,10 @@ A reference implementation of fetch for Next.js App Router, covering both Server
 - **Typed error classification** — Errors are explicitly categorized as `TimeoutError`, `AbortError`, `NetworkError`, `HTTPError`, `ParseError`, `ResponseTooLargeError`, or `UnknownFetchError`, enabling exhaustive handling at the call site
 - **Timeout control** — Timeout implemented via `AbortController`, composable with externally provided `AbortSignal`
 - **Abort race condition handling** — Checks abort state both before and after `addEventListener` to avoid a race between signal registration and an already-aborted signal
-- **Response parsing** — Automatically detects JSON vs. plain text via `Content-Type`. Handles 204 / 304 correctly
-- **Response-size cap** — Responses larger than `MAX_RESPONSE_BYTES` (10 MB) are rejected with `ResponseTooLargeError`, checked against `Content-Length` up front and the actual bytes after reading
-- **NDJSON streaming** — `streamNdjson` yields one parsed item per line as it arrives instead of buffering the whole body; `streamWithResume` adds cursor-based reconnect that resumes from the last item after a retryable mid-stream failure
+- **Response parsing** — Automatically detects JSON vs. plain text via `Content-Type` (`application/json` plus the `+json` suffix family, so RFC 7807 `application/problem+json` error bodies parse too). Handles 204 / 304 correctly
+- **Response-size cap (buffered path)** — Responses larger than `MAX_RESPONSE_BYTES` (10 MiB) are rejected with `ResponseTooLargeError`, checked against `Content-Length` up front and then counted in **bytes** as chunks arrive, so an oversized body is dropped mid-read rather than measured after it is already in memory
+- **Line-size cap (streaming path)** — `streamNdjson` puts no limit on the total length of a stream (that is the point of streaming); it bounds a *single line* instead, since the line buffer is the only thing that accumulates. An upstream that never sends a newline is cut off at `MAX_RESPONSE_BYTES`
+- **NDJSON streaming** — `streamNdjson` yields one parsed item per line as it arrives instead of buffering the whole body; `streamWithResume` adds cursor-based reconnect that resumes from the last item after a retryable mid-stream failure, backing off (jittered, `resumeBaseDelayMs`) before a reconnect that made no progress
 - **SWR integration** — The `useFetcher` hook wires the fetcher into SWR with a retryable-error policy and exponential backoff + equal jitter
 
 ## Directory Structure
@@ -131,7 +132,11 @@ try {
 
 ### SWR integration (Client Component)
 
-The `useFetcher` hook wraps SWR with the shared fetcher and a retry policy: it only retries errors classified as retryable by `isRetryable` (e.g. network errors and configured status codes), up to `MAX_RETRY_COUNT`, using exponential backoff with equal jitter to avoid a thundering herd.
+The `useFetcher` hook wraps SWR with the shared fetcher and a retry policy: it only retries errors classified as retryable by `isRetryable` — a transient transport failure (`NetworkError`, `TimeoutError`) or a status listed in `retryOn` — up to `MAX_RETRY_COUNT`, using exponential backoff with equal jitter to avoid a thundering herd. Anything else, including `UnknownFetchError`, is not replayed.
+
+**Retry-After.** When the upstream answers 429 or 503 with a `Retry-After` header — either `Retry-After: 120` or an HTTP-date — `HTTPError.retryAfterMs` carries it, and `planRetry` honors it: it waits at least that long, never *shorter* than its own backoff, and re-jitters on top (an HTTP-date is an absolute instant, so clients honoring it verbatim would all return in the same millisecond). A wait longer than `MAX_RETRY_DELAY_MS` gives up instead of holding the request open. `toErrorResponse` relays the header, so a browser client behind an API route is paced by the origin rather than guessing.
+
+**Retries and idempotency.** `isRetryable` takes an optional `method` and returns `false` for non-idempotent ones (`POST`, `PATCH`): a timeout or a dropped connection cannot tell you whether the server already applied the write, so replaying it risks a duplicate record. Both retry drivers (`useFetcher` and `streamWithResume`) pass the method through, and there is deliberately no option to switch the guard off: this fetcher talks to arbitrary backends, so it cannot know whether a given endpoint deduplicates writes. If you have an endpoint that does — one that honors an `Idempotency-Key` you send via `headers` — the decision to retry it belongs at that call site, which knows the endpoint, not in this layer.
 
 ```ts
 "use client";

@@ -7,6 +7,7 @@ import {
   HTTPError,
   NetworkError,
   ParseError,
+  ResponseTooLargeError,
 } from "@/lib/fetcher/errors";
 
 // Node fetch needs absolute URLs; MSW (started in src/test/setup.ts) intercepts.
@@ -94,6 +95,83 @@ describe("streamNdjson", () => {
       out.push(item);
     }
     expect(out.map((i) => i.id)).toEqual([1, 2, 3]);
+  });
+});
+
+describe("streamNdjson size limits", () => {
+  const MiB = 1024 * 1024;
+
+  const streamOf = (chunks: string[]) =>
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        const encoder = new TextEncoder();
+        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+        controller.close();
+      },
+    });
+
+  it("does not cap the total length of the stream", async () => {
+    // Well past MAX_RESPONSE_BYTES in total, but every line is small: streaming
+    // exists precisely for bodies that do not fit in memory.
+    const filler = "x".repeat(MiB);
+    const lines = Array.from(
+      { length: 12 },
+      (_, i) => `${JSON.stringify({ id: i + 1, filler })}\n`,
+    );
+    server.use(
+      http.get(
+        `${BASE}/stream`,
+        () =>
+          new HttpResponse(streamOf(lines), {
+            headers: { "Content-Type": "application/x-ndjson" },
+          }),
+      ),
+    );
+
+    const ids: number[] = [];
+    for await (const item of streamNdjson<Item>(`${BASE}/stream`)) {
+      ids.push(item.id);
+    }
+    expect(ids).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  });
+
+  it("rejects a single line that never terminates", async () => {
+    // No newline anywhere: toLines' buffer would grow until the process dies.
+    const chunks = Array.from({ length: 11 }, () => "x".repeat(MiB));
+    server.use(
+      http.get(
+        `${BASE}/stream`,
+        () =>
+          new HttpResponse(streamOf(chunks), {
+            headers: { "Content-Type": "application/x-ndjson" },
+          }),
+      ),
+    );
+
+    await expect(
+      collect(streamNdjson<Item>(`${BASE}/stream`)),
+    ).rejects.toThrow(ResponseTooLargeError);
+  });
+
+  it("counts each line separately, not cumulatively", async () => {
+    // Two lines that are individually fine but together exceed the limit.
+    const half = "x".repeat(6 * MiB);
+    server.use(
+      http.get(
+        `${BASE}/stream`,
+        () =>
+          new HttpResponse(
+            streamOf([
+              `${JSON.stringify({ id: 1, half })}\n`,
+              `${JSON.stringify({ id: 2, half })}\n`,
+            ]),
+            { headers: { "Content-Type": "application/x-ndjson" } },
+          ),
+      ),
+    );
+
+    const items = await collect(streamNdjson<Item>(`${BASE}/stream`));
+    expect(items.map((i) => i.id)).toEqual([1, 2]);
   });
 });
 
@@ -191,7 +269,10 @@ describe("streamWithResume", () => {
     // maxResumes: 1 would kill a lifetime-budget impl after the first drop;
     // progress must refresh it so all 5 items still arrive.
     const items = await collect(
-      streamWithResume<Item>(buildUrl, getCursor, { maxResumes: 1 }),
+      streamWithResume<Item>(buildUrl, getCursor, {
+        maxResumes: 1,
+        resumeBaseDelayMs: 1,
+      }),
     );
     expect(items.map((i) => i.id)).toEqual([1, 2, 3, 4, 5]);
     expect(attempt).toBe(6); // 5 progressing drops + 1 clean finish
@@ -214,8 +295,71 @@ describe("streamWithResume", () => {
     );
 
     await expect(
-      collect(streamWithResume<Item>(buildUrl, getCursor, { maxResumes: 2 })),
+      collect(
+        streamWithResume<Item>(buildUrl, getCursor, {
+          maxResumes: 2,
+          resumeBaseDelayMs: 1,
+        }),
+      ),
     ).rejects.toThrow(NetworkError);
     expect(attempt).toBe(3); // initial + 2 resumes, all zero-progress
+  });
+
+  it("backs off before a no-progress reconnect instead of looping tight", async () => {
+    let attempt = 0;
+    server.use(
+      http.get(`${BASE}/stream`, () => {
+        attempt += 1;
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.error(new Error("connection dropped"));
+          },
+        });
+        return new HttpResponse(stream, {
+          headers: { "Content-Type": "application/x-ndjson" },
+        });
+      }),
+    );
+
+    const started = Date.now();
+    await expect(
+      collect(
+        streamWithResume<Item>(buildUrl, getCursor, {
+          maxResumes: 2,
+          resumeBaseDelayMs: 200,
+        }),
+      ),
+    ).rejects.toThrow(NetworkError);
+    // Equal jitter: >= 100 for the first reconnect and >= 200 for the second.
+    expect(Date.now() - started).toBeGreaterThanOrEqual(300);
+    expect(attempt).toBe(3);
+  });
+
+  it("abandons a pending backoff as soon as the caller aborts", async () => {
+    server.use(
+      http.get(`${BASE}/stream`, () => {
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.error(new Error("connection dropped"));
+          },
+        });
+        return new HttpResponse(stream, {
+          headers: { "Content-Type": "application/x-ndjson" },
+        });
+      }),
+    );
+
+    const controller = new AbortController();
+    const started = Date.now();
+    const promise = collect(
+      streamWithResume<Item>(buildUrl, getCursor, {
+        signal: controller.signal,
+        // Long enough that finishing on time proves we did not sit out the wait.
+        resumeBaseDelayMs: 30_000,
+      }),
+    );
+    setTimeout(() => controller.abort(), 50);
+    await expect(promise).rejects.toThrow();
+    expect(Date.now() - started).toBeLessThan(5_000);
   });
 });

@@ -109,6 +109,38 @@ describe("fetcher", () => {
     await expect(fetcher(`${BASE}/api/down`)).rejects.toThrow(NetworkError);
   });
 
+  it("captures Retry-After from the failing response", async () => {
+    server.use(
+      http.get(
+        `${BASE}/api/limited`,
+        () =>
+          new HttpResponse(null, {
+            status: 429,
+            headers: { "Retry-After": "42" },
+          }),
+      ),
+    );
+    // The Response is gone by the time the retry policy runs, so the header has
+    // to be read at throw time.
+    await expect(fetcher(`${BASE}/api/limited`)).rejects.toMatchObject({
+      status: 429,
+      retryAfterMs: 42_000,
+    });
+  });
+
+  it("leaves retryAfterMs undefined when the server sent no instruction", async () => {
+    server.use(
+      http.get(
+        `${BASE}/api/limited-silent`,
+        () => new HttpResponse(null, { status: 429 }),
+      ),
+    );
+    await expect(fetcher(`${BASE}/api/limited-silent`)).rejects.toMatchObject({
+      status: 429,
+      retryAfterMs: undefined,
+    });
+  });
+
   it("throws ResponseTooLargeError when content-length exceeds the limit", async () => {
     // Body is tiny, but the declared content-length is huge: reject up-front.
     server.use(
@@ -129,7 +161,7 @@ describe("fetcher", () => {
   });
 
   it("throws ResponseTooLargeError when the read body exceeds the limit", async () => {
-    // No content-length (chunked); caught by the post-read size check.
+    // No content-length (chunked); caught while reading, by byte count.
     const huge = "x".repeat(MAX_RESPONSE_BYTES + 1);
     server.use(
       http.get(
@@ -141,6 +173,28 @@ describe("fetcher", () => {
       ),
     );
     await expect(fetcher(`${BASE}/api/huge-chunked`)).rejects.toThrow(
+      ResponseTooLargeError,
+    );
+  });
+
+  it("counts the cap in bytes, not UTF-16 code units", async () => {
+    // 3.5M Japanese characters: ~3.5M code units (under the cap if you measure
+    // `text.length`) but ~10.5MB once UTF-8 encoded (over it).
+    const multibyte = "\u3042".repeat(3_500_000);
+    expect(multibyte.length).toBeLessThan(MAX_RESPONSE_BYTES);
+    expect(new TextEncoder().encode(multibyte).byteLength).toBeGreaterThan(
+      MAX_RESPONSE_BYTES,
+    );
+    server.use(
+      http.get(
+        `${BASE}/api/huge-multibyte`,
+        () =>
+          new HttpResponse(multibyte, {
+            headers: { "Content-Type": "text/plain" },
+          }),
+      ),
+    );
+    await expect(fetcher(`${BASE}/api/huge-multibyte`)).rejects.toThrow(
       ResponseTooLargeError,
     );
   });
@@ -163,7 +217,7 @@ describe("buildMutationOptions", () => {
   it("sets method and JSON headers for plain object body", () => {
     const opts = buildMutationOptions("POST", { body: { name: "test" } });
     expect(opts.method).toBe("POST");
-    expect((opts.headers as Record<string, string>)["Content-Type"]).toBe(
+    expect(new Headers(opts.headers).get("Content-Type")).toBe(
       "application/json",
     );
     expect(opts.body).toBe(JSON.stringify({ name: "test" }));
@@ -180,6 +234,37 @@ describe("buildMutationOptions", () => {
   it("sets body to undefined when no body provided", () => {
     const opts = buildMutationOptions("DELETE", {});
     expect(opts.body).toBeUndefined();
+  });
+
+  it("keeps headers passed as a Headers instance", () => {
+    // Spreading a Headers instance yields {} — the header would vanish silently.
+    const opts = buildMutationOptions("POST", {
+      body: { name: "test" },
+      headers: new Headers({ Authorization: "Bearer token" }),
+    });
+    const headers = new Headers(opts.headers);
+    expect(headers.get("Authorization")).toBe("Bearer token");
+    expect(headers.get("Content-Type")).toBe("application/json");
+  });
+
+  it("keeps headers passed as a [key, value][]", () => {
+    const opts = buildMutationOptions("POST", {
+      body: { name: "test" },
+      headers: [["X-Request-Id", "abc"]],
+    });
+    const headers = new Headers(opts.headers);
+    expect(headers.get("X-Request-Id")).toBe("abc");
+    expect(headers.get("Content-Type")).toBe("application/json");
+  });
+
+  it("lets an explicit Content-Type win", () => {
+    const opts = buildMutationOptions("POST", {
+      body: { name: "test" },
+      headers: { "Content-Type": "application/merge-patch+json" },
+    });
+    expect(new Headers(opts.headers).get("Content-Type")).toBe(
+      "application/merge-patch+json",
+    );
   });
 });
 

@@ -1,8 +1,4 @@
-import {
-  DEFAULT_TIMEOUT_MS,
-  MAX_RESPONSE_BYTES,
-  StatusCode,
-} from "@/lib/fetcher/consts";
+import { DEFAULT_TIMEOUT_MS, MAX_RESPONSE_BYTES } from "@/lib/fetcher/consts";
 import {
   AbortError,
   HTTPError,
@@ -13,7 +9,42 @@ import {
   UnknownFetchError,
 } from "@/lib/fetcher/errors";
 import { FetcherOptions, MutationOptions } from "@/lib/fetcher/types";
-import { isAbortError } from "@/lib/fetcher/utils";
+import { isAbortError, isJsonContentType } from "@/lib/fetcher/utils";
+
+/**
+ * Read a body to text while enforcing the size cap in *bytes*.
+ *
+ * `text.length` after `response.text()` is wrong twice over: it counts UTF-16
+ * code units, so multi-byte UTF-8 (Japanese is 3 bytes per character) slips
+ * through at up to three times the limit — and the whole body is in memory by
+ * then anyway, which is what the cap exists to prevent.
+ */
+async function readTextWithinCap(response: Response): Promise<string> {
+  if (!response.body) return "";
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let total = 0;
+  let text = "";
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > MAX_RESPONSE_BYTES) {
+        throw new ResponseTooLargeError(MAX_RESPONSE_BYTES);
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    return text + decoder.decode();
+  } finally {
+    // Tear the connection down if we bailed out early. Not awaited: cancel()
+    // settles only once the peer acknowledges, which a stalled connection may
+    // never do — and we already have the result we are returning.
+    void reader.cancel().catch(() => {});
+  }
+}
 
 async function parseResponse(response: Response): Promise<unknown> {
   // 204 No Content and 304 Not Modified are valid responses with no body.
@@ -29,23 +60,18 @@ async function parseResponse(response: Response): Promise<unknown> {
 
   let text: string;
   try {
-    text = await response.text();
+    text = await readTextWithinCap(response);
   } catch (error) {
-    // Treat a stream read failure as a NetworkError.
+    // The cap and an abort are already the right classification; anything else
+    // that breaks mid-read is a dropped connection.
+    if (error instanceof ResponseTooLargeError) throw error;
+    if (isAbortError(error)) throw error;
     throw new NetworkError("Failed to read response body", error);
   }
 
-  // In case content-length is absent (e.g. chunked), re-check against the actual read size.
-  if (text.length > MAX_RESPONSE_BYTES) {
-    throw new ResponseTooLargeError(MAX_RESPONSE_BYTES);
-  }
-
-  const contentType = response.headers.get("content-type");
-  const isJson = contentType?.includes("application/json");
-
   if (!text) return null;
 
-  if (isJson) {
+  if (isJsonContentType(response)) {
     try {
       return JSON.parse(text);
     } catch (error) {
@@ -136,11 +162,7 @@ export async function fetcher<T>(
     const body = await parseResponse(response);
 
     if (!response.ok) {
-      throw new HTTPError(
-        response.status as StatusCode,
-        response.statusText,
-        body,
-      );
+      throw HTTPError.fromResponse(response, body);
     }
 
     return body as T;
@@ -163,13 +185,18 @@ export function buildMutationOptions(
     return { ...rest, method, body };
   }
 
+  // Normalize through Headers rather than spreading: a HeadersInit may be a
+  // Headers instance (spreads to {}, dropping every header the caller set) or a
+  // [key, value][] (spreads to {0: [...]}).
+  const headers = new Headers(rest.headers);
+  if (!headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+
   return {
     ...rest,
     method,
-    headers: {
-      "Content-Type": "application/json",
-      ...rest.headers,
-    },
+    headers,
     body: body !== undefined ? JSON.stringify(body) : undefined,
   };
 }
