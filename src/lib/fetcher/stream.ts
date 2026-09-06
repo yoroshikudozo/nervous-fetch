@@ -4,7 +4,7 @@ import {
   DEFAULT_TIMEOUT_MS,
   MAX_RESPONSE_BYTES,
   MAX_RETRY_COUNT,
-  StatusCode,
+  RETRY_BASE_DELAY_MS,
 } from "@/lib/fetcher/consts";
 import {
   HTTPError,
@@ -13,14 +13,14 @@ import {
   ResponseTooLargeError,
 } from "@/lib/fetcher/errors";
 import { FetcherOptions } from "@/lib/fetcher/types";
-import { isAbortError, isRetryable } from "@/lib/fetcher/utils";
+import { isAbortError, isRetryable, planRetry } from "@/lib/fetcher/utils";
 
 // The body is consumed as a small pipeline of single-responsibility async
 // generators, so the orchestration reads top-to-bottom and the only mutable
 // state left lives — isolated — inside the stage that needs it:
 //
-//   readBytes ─▶ monitor ─▶ decode ─▶ toLines ─▶ parseLine
-//   (read+time) (size cap) (text)    (whole lines) (items)
+//   readBytes ─▶ guardLines ─▶ decode ─▶ toLines ─▶ parseLine
+//   (read+time) (line cap)   (text)    (whole lines) (items)
 
 /** Iterate a byte stream via a reader (works in every runtime, unlike
  * `for await` over a ReadableStream), normalizing a mid-stream failure to
@@ -51,21 +51,41 @@ async function* readBytes(
       yield result.value;
     }
   } finally {
-    // Consumer stopped early or we errored: tear the connection down.
-    await reader.cancel().catch(() => {});
+    // Consumer stopped early or we errored: tear the connection down. Not
+    // awaited — cancel() waits on the peer, so a dead connection would hang the
+    // caller's `break` out of the loop.
+    void reader.cancel().catch(() => {});
   }
 }
 
-/** Pass bytes through untouched while enforcing the response-size cap. */
-async function* monitor(
+/** Pass bytes through untouched while bounding the length of a single line.
+ *
+ * Total stream length is deliberately *not* capped — outgrowing memory is the
+ * case this API exists for. What can grow without bound is toLines' buffer,
+ * which accumulates until a newline arrives, so that is what we bound.
+ *
+ * Measured on raw bytes: a UTF-8 newline is always the single byte 0x0A and
+ * never occurs inside a multi-byte character, so scanning here is exact, needs
+ * no decoding, and counts bytes — which is what a memory limit means. */
+async function* guardLines(
   chunks: AsyncIterable<Uint8Array>,
+  maxLineBytes: number,
 ): AsyncGenerator<Uint8Array> {
-  let total = 0;
+  const tooLong = () =>
+    new ResponseTooLargeError(maxLineBytes, undefined, "A single line");
+  let pending = 0; // bytes seen since the last newline
+
   for await (const chunk of chunks) {
-    total += chunk.byteLength;
-    if (total > MAX_RESPONSE_BYTES) {
-      throw new ResponseTooLargeError(MAX_RESPONSE_BYTES);
+    let start = 0;
+    let newline: number;
+    while ((newline = chunk.indexOf(0x0a, start)) !== -1) {
+      pending += newline - start;
+      if (pending > maxLineBytes) throw tooLong();
+      pending = 0;
+      start = newline + 1;
     }
+    pending += chunk.byteLength - start;
+    if (pending > maxLineBytes) throw tooLong();
     yield chunk;
   }
 }
@@ -141,15 +161,21 @@ export async function* streamNdjson<T>(
     // 204/304 are body-less successful completions (matches the buffered parseResponse).
     if (response.status === 204 || response.status === 304) return;
     if (!response.ok) {
-      throw new HTTPError(
-        response.status as StatusCode,
-        response.statusText,
+      throw HTTPError.fromResponse(
+        response,
         await response.text().catch(() => null),
       );
     }
     if (!response.body) return;
 
-    const lines = toLines(decode(monitor(readBytes(response.body, controller, timeout))));
+    const lines = toLines(
+      decode(
+        guardLines(
+          readBytes(response.body, controller, timeout),
+          MAX_RESPONSE_BYTES,
+        ),
+      ),
+    );
     for await (const line of lines) yield parseLine<T>(line);
   } catch (error) {
     throw mapRequestError(error, getReason(), timeout);
@@ -162,6 +188,23 @@ export async function* streamNdjson<T>(
 export interface ResumeOptions extends FetcherOptions {
   /** Max *consecutive* no-progress reconnects before giving up and rethrowing. */
   maxResumes?: number;
+  /** Base backoff before a no-progress reconnect (doubles per consecutive failure). */
+  resumeBaseDelayMs?: number;
+}
+
+/** Wait `ms`, resolving early if the caller cancels, so a pending backoff never
+ * outlives an abort. */
+function wait(ms: number, signal?: AbortSignal | null): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    const finish = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    signal?.addEventListener("abort", finish);
+  });
 }
 
 /**
@@ -182,7 +225,11 @@ export async function* streamWithResume<T>(
   getCursor: (item: T) => string,
   options: ResumeOptions = {},
 ): AsyncGenerator<T> {
-  const { maxResumes = MAX_RETRY_COUNT, ...fetchOptions } = options;
+  const {
+    maxResumes = MAX_RETRY_COUNT,
+    resumeBaseDelayMs = RETRY_BASE_DELAY_MS,
+    ...fetchOptions
+  } = options;
   let cursor: string | null = null;
   let resumes = 0;
 
@@ -199,13 +246,25 @@ export async function* streamWithResume<T>(
       if (
         fetchOptions.signal?.aborted ||
         !(error instanceof Error) ||
-        !isRetryable(error, DEFAULT_RETRY_ON)
+        !isRetryable(error, DEFAULT_RETRY_ON, fetchOptions.method)
       ) {
         throw error;
       }
-      // Reset the budget on progress; only zero-progress consecutive reconnects hit maxResumes.
-      if (progressed) resumes = 0;
-      else if (++resumes > maxResumes) throw error;
+      // The stream was advancing, so there is nothing to back off from.
+      if (progressed) {
+        resumes = 0;
+        continue;
+      }
+      // Only zero-progress reconnects spend the budget — and they wait first, so
+      // a server that is down isn't hit by a tight reconnect loop.
+      const delay = planRetry(error, ++resumes, {
+        retryOn: DEFAULT_RETRY_ON,
+        method: fetchOptions.method,
+        maxRetries: maxResumes,
+        baseDelayMs: resumeBaseDelayMs,
+      });
+      if (delay === null) throw error;
+      await wait(delay, fetchOptions.signal);
     }
   }
 }

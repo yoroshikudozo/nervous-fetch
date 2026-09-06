@@ -1,6 +1,9 @@
 export const DEFAULT_TIMEOUT_MS = 10000;
 export const RETRY_BASE_DELAY_MS = 1000;
 export const MAX_RETRY_COUNT = 3;
+// Ceiling on a single retry wait: past this we stop retrying rather than hold a
+// request open, so one `Retry-After` header can't pin a client for hours.
+export const MAX_RETRY_DELAY_MS = 30000;
 // Upper bound on a response body we will buffer into memory (10 MiB), so a
 // hostile or runaway upstream can't OOM the process.
 export const MAX_RESPONSE_BYTES = 10 * 1024 * 1024;

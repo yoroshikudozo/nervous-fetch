@@ -1,12 +1,8 @@
 "use client";
 
 import useSWR, { type SWRConfiguration } from "swr";
-import { fetcher, isRetryable, FetcherOptions } from "@/lib/fetcher";
-import {
-  RETRY_BASE_DELAY_MS,
-  MAX_RETRY_COUNT,
-  DEFAULT_RETRY_ON,
-} from "@/lib/fetcher";
+import { fetcher, planRetry, FetcherOptions } from "@/lib/fetcher";
+import { DEFAULT_RETRY_ON } from "@/lib/fetcher";
 
 interface UseFetcherOptions<T> extends FetcherOptions {
   retryOn?: number[];
@@ -21,15 +17,18 @@ export function useFetcher<T>(url: string, options: UseFetcherOptions<T> = {}) {
   } = options;
 
   return useSWR<T>(url, (url) => fetcher<T>(url, fetcherOptions), {
+    // SWR increments before calling us, so `retryCount` is 1-based. The policy
+    // itself lives in planRetry.
     onErrorRetry: (error, _key, _config, revalidate, { retryCount }) => {
-      if (!isRetryable(error, retryOn)) return;
-      if (retryCount >= MAX_RETRY_COUNT) return;
-      // Exponential backoff with equal jitter, so many clients failing at the
-      // same moment don't retry in lockstep and hammer the server (thundering
-      // herd). Each retry waits half the backoff plus a random half.
-      const backoff = RETRY_BASE_DELAY_MS * 2 ** retryCount;
-      const delay = backoff / 2 + Math.random() * (backoff / 2);
-      setTimeout(() => revalidate({ retryCount }), delay);
+      const delay = planRetry(error, retryCount, {
+        retryOn,
+        // Guards a caller who wires this to something other than a GET.
+        method: fetcherOptions.method,
+      });
+      if (delay === null) return;
+      // `dedupe: true` mirrors SWR's own retry path: without it, every hook
+      // sharing this key fires its own retry request.
+      setTimeout(() => revalidate({ retryCount, dedupe: true }), delay);
     },
     ...swrOptions,
   });
